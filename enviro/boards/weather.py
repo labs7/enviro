@@ -91,7 +91,7 @@ def check_trigger():
 
   last_rain_trigger = rain_sensor_trigger
 
-def wind_speed(sample_time_ms=1000):
+def wind_speed(sample_time_ms=10000):
   # get initial sensor state
   state = wind_speed_pin.value()
 
@@ -107,56 +107,80 @@ def wind_speed(sample_time_ms=1000):
       ticks.append(time.ticks_ms())
       state = now
 
+  logging.info(f"ticks: {ticks}")
+
+  # Filter out duplicate ticks that may occur due to noise/bouncing
+  filtered_ticks = []
+  for tick in ticks:
+    if not filtered_ticks or tick != filtered_ticks[-1]:
+      filtered_ticks.append(tick)
+  ticks = filtered_ticks
+
+  logging.info(f"filtered_ticks: {filtered_ticks}")
+
   # if no sensor connected then we have no readings, skip
   if len(ticks) < 2:
-    return 0
+    return 0, 0, 0
 
-  # calculate the average tick between transitions in ms
+  # calculate the average, min and max tick between transitions in ms
   average_tick_ms = (time.ticks_diff(ticks[-1], ticks[0])) / (len(ticks) - 1)
+  min_tick_ms = 10000
+  max_tick_ms = 0
+  for i in range(1, len(ticks)):
+    tick_diff = time.ticks_diff(ticks[i], ticks[i-1])
+    max_tick_ms = max(max_tick_ms, tick_diff)
+    if max_tick_ms > 0:
+      min_tick_ms_tmp = min(min_tick_ms, tick_diff)
+      if min_tick_ms_tmp > 0:
+        min_tick_ms = min_tick_ms_tmp
 
-  if average_tick_ms == 0:
-    return 0
-  # work out rotation speed in hz (two ticks per rotation)
-  rotation_hz = (1000 / average_tick_ms) / 2
+  logging.info(f"average_tick_ms: {average_tick_ms}")
+  logging.info(f"min_tick_ms: {min_tick_ms}")
+  logging.info(f"max_tick_ms: {max_tick_ms}")
 
-  # calculate the wind speed in metres per second
-  circumference = WIND_CM_RADIUS * 2.0 * math.pi
-  wind_m_s = rotation_hz * circumference * WIND_FACTOR
+  # Handle cases where individual values are 0
+  avg_wind_m_s = min_wind_m_s = max_wind_m_s = 0
+  
+  if average_tick_ms == 0 and max_tick_ms == 0:
+    return 0, 0, 0
+    
+  # Calculate only for non-zero values
+  if average_tick_ms != 0:
+    avg_rotation_hz = (1000 / average_tick_ms) / 2
+    circumference = WIND_CM_RADIUS * 2.0 * math.pi
+    avg_wind_m_s = avg_rotation_hz * circumference * WIND_FACTOR
+    
+  if min_tick_ms != 0:
+    max_rotation_hz = (1000 / min_tick_ms) / 2
+    circumference = WIND_CM_RADIUS * 2.0 * math.pi
+    max_wind_m_s = max_rotation_hz * circumference * WIND_FACTOR
+    
+  if max_tick_ms != 0:
+    min_rotation_hz = (1000 / max_tick_ms) / 2
+    circumference = WIND_CM_RADIUS * 2.0 * math.pi
+    min_wind_m_s = min_rotation_hz * circumference * WIND_FACTOR
 
-  return wind_m_s
+  return avg_wind_m_s, max_wind_m_s, min_wind_m_s
 
 def wind_direction():
-  # adc reading voltage to cardinal direction taken from our python
-  # library - each array index represents a 45 degree step around
-  # the compass (index 0 == 0, 1 == 45, 2 == 90, etc.)
-  # we find the closest matching value in the array and use the index
-  # to determine the heading
-  ADC_TO_DEGREES = (0.9, 2.0, 3.0, 2.8, 2.5, 1.5, 0.3, 0.6)
-
-  closest_index = -1
-  last_index = None
-
-  # ensure we have two readings that match in a row as otherwise if
-  # you read during transition between two values it can glitch
-  # fixes https://github.com/pimoroni/enviro/issues/20
-  while True:
-    value = wind_direction_pin.read_voltage()
-
-    closest_index = -1
-    closest_value = float('inf')
-
-    for i in range(8):
-      distance = abs(ADC_TO_DEGREES[i] - value)
-      if distance < closest_value:
-        closest_value = distance
-        closest_index = i
-
-    if last_index == closest_index:
-      break
-
-    last_index = closest_index
-
-  return closest_index * 45
+    REFERENCE_VOLTAGE = 3.0  # Reference voltage that corresponds to 90 degrees
+    
+    # Read voltage with basic debouncing
+    last_value = None
+    while True:
+        value = wind_direction_pin.read_voltage()
+        
+        if last_value is not None and abs(value - last_value) < 0.1:  # Debouncing threshold
+            break
+        last_value = value
+    
+    # Convert voltage to degrees: (voltage / 3.0V) * 90° to get the proper scaling
+    degree = (value / REFERENCE_VOLTAGE) * 90
+    
+    # Ensure the value stays within 0-360 range
+    degree = degree % 360
+    
+    return round(degree, 1)
 
 def rainfall(seconds_since_last):
   amount = 0
@@ -189,6 +213,7 @@ def get_sensor_readings(seconds_since_last, is_usb_power):
 
   ltr_data = ltr559.get_reading()
   rain, rain_per_second = rainfall(seconds_since_last)
+  avg_wind_speed, max_wind_speed, min_wind_speed = wind_speed()
 
   from ucollections import OrderedDict
   return OrderedDict({
@@ -196,7 +221,9 @@ def get_sensor_readings(seconds_since_last, is_usb_power):
     "humidity": round(bme280_data[2], 2),
     "pressure": round(bme280_data[1] / 100.0, 2),
     "luminance": round(ltr_data[BreakoutLTR559.LUX], 2),
-    "wind_speed": wind_speed(),
+    "avg_wind_speed": avg_wind_speed,
+    "min_wind_speed": min_wind_speed,
+    "max_wind_speed": max_wind_speed,
     "rain": rain,
     "rain_per_second": rain_per_second,
     "wind_direction": wind_direction()
